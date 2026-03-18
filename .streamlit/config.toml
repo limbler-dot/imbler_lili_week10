@@ -1,0 +1,11 @@
+[theme]
+base = "dark"
+primaryColor = "#FDD5DF"
+backgroundColor = "#AF7F73"
+secondaryBackgroundColor = "#9DC183"
+textColor = "#f8fafc"
+fond = "Helvetica"
+
+[server]
+address = "localhost"
+port = 8505
