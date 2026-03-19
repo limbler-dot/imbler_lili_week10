@@ -1,4 +1,5 @@
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -11,6 +12,7 @@ import streamlit as st
 HF_CHAT_COMPLETIONS_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
 CHATS_DIR = Path(__file__).resolve().parent / "chats"
+MEMORY_PATH = Path(__file__).resolve().parent / "memory.json"
 
 
 def extract_generated_text(payload: Any) -> Optional[str]:
@@ -33,6 +35,114 @@ def extract_generated_text(payload: Any) -> Optional[str]:
     if isinstance(payload, dict) and "generated_text" in payload:
         return str(payload["generated_text"])
     return None
+
+
+def iter_sse_content_lines(response: requests.Response) -> Any:
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if not raw_line:
+            continue
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:") :].strip()
+        if data == "[DONE]":
+            break
+        yield data
+
+
+def extract_delta_content(chunk: Dict[str, Any]) -> str:
+    choices = chunk.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            delta = first.get("delta")
+            if isinstance(delta, dict):
+                return str(delta.get("content") or "")
+            message = first.get("message")
+            if isinstance(message, dict):
+                return str(message.get("content") or "")
+    return ""
+
+
+def load_memory() -> Dict[str, Any]:
+    if not MEMORY_PATH.exists():
+        return {"facts": []}
+    try:
+        raw = MEMORY_PATH.read_text(encoding="utf-8").strip()
+        if not raw:
+            return {"facts": []}
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return {"facts": []}
+    facts = data.get("facts")
+    if not isinstance(facts, list):
+        facts = []
+    return {"facts": facts}
+
+
+def save_memory(memory: Dict[str, Any]) -> None:
+    payload = {"facts": memory.get("facts", [])}
+    MEMORY_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def merge_facts(existing: List[str], new_facts: List[str]) -> List[str]:
+    normalized = {fact.strip(): True for fact in existing if isinstance(fact, str) and fact.strip()}
+    for fact in new_facts:
+        if isinstance(fact, str) and fact.strip():
+            normalized.setdefault(fact.strip(), True)
+    return list(normalized.keys())
+
+
+def extract_memory_facts(token: str, user_message: str) -> List[str]:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    system_prompt = (
+        "Extract personal traits or preferences mentioned by the user in the message. "
+        "Examples: name, preferred language, interests, communication style, favorite topics, "
+        "or other useful personal preferences. "
+        "Return ONLY valid JSON with a single key 'facts' that maps to a list of short strings. "
+        "If there are no traits or preferences, return {\"facts\": []}."
+    )
+    payload = {
+        "model": HF_MODEL_ID,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        "stream": False,
+    }
+    try:
+        response = requests.post(
+            HF_CHAT_COMPLETIONS_URL, headers=headers, json=payload, timeout=30
+        )
+    except requests.RequestException:
+        return []
+    if response.status_code >= 400:
+        return []
+    try:
+        data = response.json()
+    except json.JSONDecodeError:
+        return []
+    content = extract_generated_text(data)
+    if not content:
+        return []
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        start = content.find("{")
+        end = content.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return []
+        try:
+            parsed = json.loads(content[start : end + 1])
+        except json.JSONDecodeError:
+            return []
+    facts = parsed.get("facts")
+    if not isinstance(facts, list):
+        return []
+    return [str(f).strip() for f in facts if isinstance(f, str) and f.strip()]
 
 
 def ensure_conversations() -> List[Dict[str, Any]]:
@@ -144,6 +254,7 @@ st.caption("Chat with your HF inference endpoint and review results.")
 
 conversations = ensure_conversations()
 active_index = ensure_active_conversation_index()
+memory = load_memory()
 
 with st.sidebar:
     st.subheader("Conversations")
@@ -221,14 +332,24 @@ if user_input:
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
+        messages = current_conversation["messages"]
+        if memory.get("facts"):
+            system_memory = "Known user preferences: " + "; ".join(memory["facts"])
+            messages = [{"role": "system", "content": system_memory}] + messages
+
         payload = {
             "model": HF_MODEL_ID,
-            "messages": current_conversation["messages"],
+            "messages": messages,
+            "stream": True,
         }
         with st.spinner("Contacting endpoint..."):
             try:
                 response = requests.post(
-                    HF_CHAT_COMPLETIONS_URL, headers=headers, json=payload, timeout=60
+                    HF_CHAT_COMPLETIONS_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=60,
+                    stream=True,
                 )
             except requests.RequestException as exc:
                 error_message = f"Request failed: {exc}"
@@ -246,26 +367,30 @@ if user_input:
                     )
                     save_conversation(current_conversation)
                 else:
-                    try:
-                        data = response.json()
-                    except json.JSONDecodeError:
-                        error_message = "Response was not valid JSON."
-                        st.error(error_message)
-                        st.code(response.text)
-                        current_conversation["messages"].append(
-                            {"role": "assistant", "content": f"Error: {error_message}"}
-                        )
-                        save_conversation(current_conversation)
-                    else:
-                        generated = extract_generated_text(data)
-                        if generated is None:
-                            st.warning("Unrecognized response shape. Showing raw JSON.")
-                            st.code(json.dumps(data, indent=2))
-                            generated = json.dumps(data)
-                        current_conversation["messages"].append(
-                            {"role": "assistant", "content": generated}
-                        )
-                        save_conversation(current_conversation)
+                    assistant_text = ""
+                    with st.chat_message("assistant"):
+                        placeholder = st.empty()
+                        for data_line in iter_sse_content_lines(response):
+                            try:
+                                chunk = json.loads(data_line)
+                            except json.JSONDecodeError:
+                                continue
+                            delta = extract_delta_content(chunk)
+                            if delta:
+                                assistant_text += delta
+                                placeholder.write(assistant_text)
+                                time.sleep(0.02)
+                        if not assistant_text:
+                            st.warning("No streamed content received.")
+                    current_conversation["messages"].append(
+                        {"role": "assistant", "content": assistant_text or "No response."}
+                    )
+                    save_conversation(current_conversation)
+                    if token and user_input:
+                        new_facts = extract_memory_facts(token, user_input)
+                        if new_facts:
+                            memory["facts"] = merge_facts(memory.get("facts", []), new_facts)
+                            save_memory(memory)
 
 if conversations:
     current_conversation = conversations[active_index]
